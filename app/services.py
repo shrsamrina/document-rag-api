@@ -1,8 +1,10 @@
 
 import logging
+import re
 import time
 
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 
 from fastapi import HTTPException
 from google.genai import errors
@@ -23,9 +25,9 @@ def generate_with_retry(
     *,
     model: str,
     contents: str,
-    config: Optional[dict] = None,
+    config: Optional[dict[str, Any]] = None,
     max_attempts: int = 3,
-):
+) -> Any:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
@@ -61,10 +63,18 @@ def generate_with_retry(
                 )
                 raise HTTPException(
                     status_code=503,
-                    detail="Gemini is temporarily unavailable. Please try again later.",
+                    detail=(
+                        "Gemini is temporarily unavailable. "
+                        "Please try again later."
+                    ),
                 ) from exc
 
             time.sleep(2 ** (attempt + 1))
+
+    raise HTTPException(
+        status_code=503,
+        detail="Gemini service is unavailable.",
+    )
 
 
 def extract_booking_details(message: str) -> BookingDetails:
@@ -74,7 +84,22 @@ Extract interview booking information from the user's message.
 User message:
 {message}
 
-Return only the information that is actually provided.
+Rules:
+- Extract only information explicitly provided.
+- Never invent missing information.
+- Convert times to 24-hour format.
+- 8am means 08:00:00.
+- 8pm means 20:00:00.
+- 12am means 00:00:00.
+- 12pm means 12:00:00.
+- Preserve the user's AM/PM designation exactly.
+- Do not assume UTC or add timezone information unless
+  the user explicitly provides a timezone.
+- Return dates in YYYY-MM-DD format.
+- Do not invent a date, time, name, or email.
+- Set confirmed to false.
+
+Return structured booking details.
 """
 
     response = generate_with_retry(
@@ -92,7 +117,31 @@ Return only the information that is actually provided.
             detail="Gemini did not return valid booking details.",
         )
 
-    return response.parsed
+    details = response.parsed
+
+    time_match = re.search(
+        r"\b(1[0-2]|0?[1-9])\s*(a\.?m\.?|p\.?m\.?)\b",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if time_match:
+        hour = int(time_match.group(1))
+        period = time_match.group(2).lower().replace(".", "")
+
+        if period == "am":
+            hour = hour % 12
+        else:
+            hour = (hour % 12) + 12
+
+        minute = 0
+
+        details.time = datetime.strptime(
+            f"{hour:02d}:{minute:02d}",
+            "%H:%M",
+        ).time()
+
+    return details
 
 
 def save_booking_state(
@@ -106,8 +155,16 @@ def save_booking_state(
         mapping={
             "name": details.name or "",
             "email": str(details.email) if details.email else "",
-            "date": details.date.isoformat() if details.date else "",
-            "time": details.time.isoformat() if details.time else "",
+            "date": (
+                details.date.isoformat()
+                if details.date
+                else ""
+            ),
+            "time": (
+                details.time.isoformat()
+                if details.time
+                else ""
+            ),
             "confirmed": str(details.confirmed),
         },
     )
@@ -181,7 +238,9 @@ def fixed_size_chunking(
     overlap: int = 100,
 ) -> list[str]:
     if chunk_size <= 0:
-        raise ValueError("chunk_size must be greater than zero")
+        raise ValueError(
+            "chunk_size must be greater than zero"
+        )
 
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError(
@@ -211,7 +270,9 @@ def line_based_chunking(
     max_chunk_size: int = 500,
 ) -> list[str]:
     if max_chunk_size <= 0:
-        raise ValueError("max_chunk_size must be greater than zero")
+        raise ValueError(
+            "max_chunk_size must be greater than zero"
+        )
 
     chunks = []
     current_chunk = ""
@@ -229,17 +290,30 @@ def line_based_chunking(
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
 
-            for start in range(0, len(line), max_chunk_size):
-                chunks.append(line[start:start + max_chunk_size])
+            for start in range(
+                0,
+                len(line),
+                max_chunk_size,
+            ):
+                chunks.append(
+                    line[start:start + max_chunk_size]
+                )
 
             continue
 
-        if len(current_chunk) + len(line) + 1 <= max_chunk_size:
+        if (
+            len(current_chunk)
+            + len(line)
+            + 1
+            <= max_chunk_size
+        ):
             current_chunk += line + "\n"
 
         else:
             if current_chunk:
-                chunks.append(current_chunk.strip())
+                chunks.append(
+                    current_chunk.strip()
+                )
 
             current_chunk = line + "\n"
 
